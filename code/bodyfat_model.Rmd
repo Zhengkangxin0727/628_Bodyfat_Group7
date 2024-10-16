@@ -1,0 +1,513 @@
+---
+title: "Bodyfat_model"
+output: html_document
+date: "2024-10-12"
+---
+**Group 7**
+**Group member:Ruijing Chen,Tianyu Yao,Kangxin Zheng**
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+**Data cleaning**
+
+```{r}
+rm(list=ls())
+df_bodyfat <- read.csv("BodyFat.csv", header = TRUE)
+
+#Check the consistency of DENSITY and BODYFAT
+calculate_body_fat <- function(D) {
+  a <- 1.10
+  b <- 0.90
+  B <- (1 / D) * (a * b / (a - b)) - (b / (a - b))
+  return(B * 100)
+}
+df_bodyfat$calculated_bodyfat <- calculate_body_fat(df_bodyfat$DENSITY)
+df_bodyfat$error <- df_bodyfat$BODYFAT - df_bodyfat$calculated_bodyfat
+error_rows1 <- df_bodyfat[abs(df_bodyfat$error) > 2, ]
+# print(error_rows1)
+indices_to_replace <- c(48, 76)# Incorrect calculation of bodyfat
+indices_to_na <- c(96, 182, 216)# Abnormal value of bodyfat
+df_bodyfat$BODYFAT[indices_to_replace] <- error_rows1$calculated_bodyfat[error_rows1$IDNO %in% indices_to_replace]
+df_bodyfat$BODYFAT[indices_to_na] <- NA
+# df_bodyfat[indices_to_replace,]
+# df_bodyfat[indices_to_na,]
+df_bodyfat <- df_bodyfat[,1:17]
+
+#Check the consistency of HEIGHT,WEIGHT,ADIPOSITY
+library(dplyr)  
+calculate_bmi <- function(weight, height) {
+  height_m <- height * 0.0254  
+  weight_kg <- weight / 2.2     
+  bmi <- weight_kg / (height_m^2)  
+  return(bmi)
+}
+df_bodyfat$calculatedBMI <- mapply(calculate_bmi, df_bodyfat$WEIGHT, df_bodyfat$HEIGHT)
+df_bodyfat$error <- df_bodyfat$ADIPOSITY - df_bodyfat$calculatedBMI
+error_rows2 <- df_bodyfat[abs(df_bodyfat$error) > 0.5, ]
+# print(error_rows2)
+calculate_height_from_bmi <- function(weight, bmi) {
+  weight_kg <- weight / 2.2     
+  height_m <- sqrt(weight_kg / bmi)  
+  height_inches <- height_m / 0.0254  
+  return(height_inches)
+}
+calculate_weight_from_bmi <- function(height, bmi) {
+  height_m <- height * 0.0254  
+  weight_kg <- bmi * (height_m^2)  
+  weight_lbs <- weight_kg * 2.2     
+  return(weight_lbs)
+}
+indices_to_na_height <- c(42,163)# Wrong calculation of HEIGHT
+indices_to_na_weight <- c(221)# Wrong calculation of WEIGHT
+df_bodyfat$HEIGHT[indices_to_na_height] <- NA
+df_bodyfat$WEIGHT[indices_to_na_weight] <- NA
+df_bodyfat <- df_bodyfat %>%
+  mutate(HEIGHT = ifelse(row_number() %in% indices_to_na_height,
+                         calculate_height_from_bmi(WEIGHT, ADIPOSITY),
+                         HEIGHT))#Impute the HEIGHT with function of WEIGHT and ADIPOSITY
+df_bodyfat <- df_bodyfat %>%
+  mutate(WEIGHT = ifelse(row_number() %in% indices_to_na_weight,
+                         calculate_weight_from_bmi(HEIGHT, ADIPOSITY),
+                         WEIGHT))#Impute the WEIGHT with function of HEIGHT and ADIPOSITY
+# df_bodyfat[indices_to_na_height,]
+# df_bodyfat[indices_to_na_weight,]
+df_bodyfat <- df_bodyfat[,1:17]
+
+#Check outliers with IQR method.Check the abnormal BODYFAT
+df_bodyfat <- df_bodyfat[, !names(df_bodyfat) %in% c("IDNO", "DENSITY")]
+find_outliers <- function(df) {
+  outlier_results <- list() 
+  for (col_name in colnames(df)) {
+    Q1 <- quantile(df[[col_name]], 0.25, na.rm = TRUE)
+    Q3 <- quantile(df[[col_name]], 0.75, na.rm = TRUE)
+    IQR <- Q3 - Q1
+    lower_bound <- Q1 - 1.5 * IQR
+    upper_bound <- Q3 + 1.5 * IQR
+    outlier_indices <- which(df[[col_name]] < lower_bound | 
+                               df[[col_name]] > upper_bound | 
+                               df[[col_name]] <= 0)
+    if (length(outlier_indices) > 0) {
+      outlier_values <- data.frame(
+        Index = outlier_indices,
+        Value = df[[col_name]][outlier_indices]
+      )
+      outlier_results[[col_name]] <- outlier_values 
+    }
+  }
+  bodyfat_outlier_indices <- which(df$BODYFAT < 3 | df$BODYFAT > 40)
+  if (length(bodyfat_outlier_indices) > 0) {
+    bodyfat_outlier_values <- data.frame(
+      Index = bodyfat_outlier_indices,
+      Value = df$BODYFAT[bodyfat_outlier_indices]
+    )
+    outlier_results[["BODYFAT"]] <- rbind(outlier_results[["BODYFAT"]], bodyfat_outlier_values)
+  }
+  return(outlier_results)
+}
+outliers_result <- find_outliers(df_bodyfat)
+# print(outliers_result)
+# Find the index that only occurs once and define them as outliers
+outliers_summary <- data.frame(Index = integer(), Feature = character(), stringsAsFactors = FALSE)
+for (feature_name in names(outliers_result)) {
+  feature_data <- outliers_result[[feature_name]]
+  feature_indexes <- feature_data$Index
+  new_rows <- data.frame(Index = feature_indexes, Feature = feature_name, stringsAsFactors = FALSE)
+  outliers_summary <- rbind(outliers_summary, new_rows)
+}
+outliers_summary <- outliers_summary[order(outliers_summary$Index), ]
+index_counts <- table(outliers_summary$Index)
+unique_indices <- as.numeric(names(index_counts[index_counts == 1]))
+outliers_summary <- outliers_summary[outliers_summary$Index %in% unique_indices, ]
+# outliers_summary
+# df_bodyfat[unique_indices,]
+
+# Impute with regression
+for (i in 1:nrow(outliers_summary)) {
+  index <- outliers_summary$Index[i]
+  feature <- outliers_summary$Feature[i]
+  df_bodyfat[index, feature] <- NA
+}
+impute_with_regression <- function(data, feature) {
+  model <- lm(as.formula(paste(feature, "~ .")), data = data)
+  predictions <- predict(model, newdata = data[is.na(data[[feature]]), ])
+  data[is.na(data[[feature]]), feature] <- predictions
+  return(data)
+}
+for (feature in unique(outliers_summary$Feature)) {
+  df_bodyfat <- impute_with_regression(df_bodyfat, feature)
+}
+
+#Define X and y
+BODYFAT<- df_bodyfat$BODYFAT
+X <- df_bodyfat[, !names(df_bodyfat) %in% "BODYFAT"]
+data <- cbind(BODYFAT, X)
+```
+
+**Data description**
+
+**Boxplot**
+
+```{r}
+library(ggplot2)
+library(reshape2)
+
+df_long <- melt(df_bodyfat[, !names(df_bodyfat) %in% c("IDNO", "DENSITY")]) 
+
+threshold <- 50 
+
+ranges <- sapply(df_bodyfat[,-1], function(x) max(x) - min(x))  
+
+df_large_range <- df_long[df_long$variable %in% names(ranges[ranges > threshold]), ]
+df_small_range <- df_long[df_long$variable %in% names(ranges[ranges <= threshold]), ]
+
+p1 <- ggplot(df_large_range, aes(x = variable, y = value, fill = variable)) +
+  geom_boxplot(outlier.color = "red", outlier.shape = 16, outlier.size = 2) +
+  labs(title = "Boxplot of Variables with Large Range", x = "Variables", y = "Values") +
+  theme_minimal(base_size = 12) +  
+  theme(axis.text.x = element_text(size = 8, angle = 45, hjust = 1),  
+        plot.title = element_text(size = 14, face = "bold")) +
+  scale_fill_brewer(palette = "Set3")  
+
+p2 <- ggplot(df_small_range, aes(x = variable, y = value, fill = variable)) +
+  geom_boxplot(outlier.color = "red", outlier.shape = 16, outlier.size = 2) +
+  labs(title = "Boxplot of Variables with Small Range", x = "Variables", y = "Values") +
+  theme_minimal(base_size = 12) +  
+  theme(axis.text.x = element_text(size = 8, angle = 45, hjust = 1),  
+        plot.title = element_text(size = 14, face = "bold")) +  
+  scale_fill_brewer(palette = "Set3")  
+print(p1)
+print(p2)
+```
+**Correlation**
+
+```{r}
+library(corrplot)
+cor_matrix <- cor(df_bodyfat, use = "complete.obs")
+corrplot(cor_matrix, method = "circle")
+```
+```{r}
+library(ggplot2)
+library(dplyr)
+cor_matrix <- cor(df_bodyfat, use = "complete.obs")
+
+cor_bodyfat <- data.frame(Feature = rownames(cor_matrix), Correlation = cor_matrix[, "BODYFAT"])
+
+cor_bodyfat <- cor_bodyfat %>% filter(Feature != "BODYFAT")
+cor_bodyfat <- cor_bodyfat[order(cor_bodyfat$Correlation, decreasing = TRUE), ]
+
+ggplot(cor_bodyfat, aes(x = reorder(Feature, Correlation), y = Correlation, fill = Correlation)) +
+  geom_bar(stat = "identity", color = "black") +  
+  coord_flip() +  
+  scale_fill_gradient2(low = "#FFB3BA", mid = "#FFE4B5", high = "#B9FBC0", midpoint = 0) + 
+  labs(title = "Correlation between BodyFat and other features",
+       x = "", y = "Correlation with BodyFat") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+**Select variable**
+
+```{r}
+library(leaps)
+result <- regsubsets(BODYFAT ~ ., data = data, nbest = 1, nvmax = NULL, method = "exhaustive")
+summary(result)
+model_summary <- summary(result)
+print(model_summary$adjr2)
+```
+
+**Models**
+
+```{r}
+model1 <- lm(BODYFAT ~ ABDOMEN, data = data)
+summary(model1)
+#model11 <- lm(BODYFAT ~WEIGHT, data = data)
+#summary(model11)
+model2 <- lm(BODYFAT  ~ WEIGHT+ABDOMEN, data = data)
+summary(model2)
+model21 <- lm(BODYFAT  ~ ABDOMEN+WRIST, data = data)
+summary(model21)
+#-0.14*data$WEIGHT+0.9*data$ABDOMEN-41
+
+#-0.14*80+0.9*55-41
+model3 <- lm(BODYFAT  ~ WEIGHT+ABDOMEN+WRIST, data = data)
+summary(model3)
+model4 <- lm(BODYFAT  ~ WEIGHT+ABDOMEN+WRIST+FOREARM, data = data)
+summary(model4)
+model5 <- lm(BODYFAT  ~ WEIGHT+ABDOMEN+WRIST+FOREARM+NECK, data = data)
+summary(model5)
+model6 <- lm(BODYFAT  ~ AGE+WEIGHT+ABDOMEN+WRIST+FOREARM+NECK+HIP+THIGH, data = data)
+summary(model6)
+```
+
+```{r}
+library(ggplot2)
+library(scales)
+accuracy_simplicity<-data.frame(Model=c(1,2,3,4,5,6),
+  Accuracy = c(0.66, 0.7187,0.7272,0.7354,0.7378,0.7389),   # 模型 1, 2, 3 的 Accuracy 值
+  Simplicity = c(1,2,3,4,5,6))
+ggplot(accuracy_simplicity,aes(x=Simplicity,y=Accuracy))+ geom_point(size = 4, color = "red", alpha = 0.8) + 
+  labs(title = "Accuracy vs Simplicity", x = "Simplicity", y = "Accuracy")+
+  theme_minimal(base_size = 15)
+```
+
+
+
+
+
+
+
+**Sensitivity Analysis (Bootstrap Resampling)**
+
+Bootstrap tends to have lower variance than LOOCV because it averages over many different subsamples of the data, providing a smoother estimate of variability.
+Bootstrap gives you confidence intervals, standard errors, and bias estimates for model parameters, which can help assess the stability of your model’s coefficients or predictions.
+Because it resamples with replacement, bootstrap can be more robust in detecting how much your model would vary across different datasets.
+
+```{r}
+library(boot)
+boot_fn <- function(data, indices) {
+  data_boot <- data[indices, ]
+  model_boot <- lm(BODYFAT ~ WEIGHT + ABDOMEN, data = data_boot)
+  return(coef(model_boot))
+}
+results <- boot(data, boot_fn, R = 1000)
+
+boot.ci(results, type = "perc", index = 2)
+
+boot.ci(results, type = "perc", index = 3)
+
+
+bootstrap_means <- apply(results$t, 2, mean)   
+bias <- bootstrap_means - results$t0           
+std_error <- apply(results$t, 2, sd)           
+
+robustness_index <- sqrt(sum((bias /results$t0)^2 + (std_error / results$t0)^2))
+```
+
+
+```{r}
+boot_fn0 <- function(data, indices) {
+  data_boot <- data[indices, ]
+  model_boot <- lm(BODYFAT ~ ABDOMEN, data = data_boot)
+  return(coef(model_boot))
+}
+results0<- boot(data, boot_fn0, R = 1000)
+std_error <- apply(results0$t, 2, sd)    
+boot.ci(results0, type = "perc", index = 2)
+
+boot.ci(results, type = "perc", index = 3)
+
+
+bootstrap_means <- apply(results0$t, 2, mean)   
+bias <- bootstrap_means - results0$t0           
+std_error <- apply(results0$t, 2, sd)           
+
+robustness_index <- sqrt(sum((bias /results0$t0)^2 + (std_error / results0$t0)^2))
+robustness_index
+```
+
+```{r}
+boot_fn2 <- function(data, indices) {
+  data_boot <- data[indices, ]
+  model_boot2 <- lm(BODYFAT ~ WEIGHT + ABDOMEN+WRIST, data = data_boot)
+  return(coef(model_boot2))
+}
+results2 <- boot(data, boot_fn2, R = 1000)
+print(results2)
+
+bootstrap_means <- apply(results2$t, 2, mean)   
+bias <- bootstrap_means - results2$t0           
+std_error <- apply(results2$t, 2, sd)           
+
+robustness_index2 <- sqrt(sum((bias /results2$t0)^2 + (std_error / results2$t0)^2))
+robustness_index2
+```
+
+The first model's intercept has slightly higher bias (−0.2108  than the second model (0.0101), but its standard error (2.8068 is much lower compared to the second model's standard error (6.6674).
+Interpretation: While the bias of the second model's intercept is smaller, the higher variability (standard error) makes it less stable. Hence, the first model’s intercept seems more robust in terms of lower variability.
+
+2. WEIGHT:
+Both models show very small bias for the WEIGHT coefficient, indicating similar stability across resampling.
+The first model’s standard error (0.0213 is slightly lower than the second model’s (0.0256).
+Interpretation: Both models perform well in terms of the WEIGHT coefficient, but the first model has marginally less variability, making it slightly more robust.
+
+3. ABDOMEN:
+The bias for the ABDOMEN coefficient is small in both models, but the second model shows a slightly higher bias (−0.0023 than the first model (−0.0012
+The standard error for ABDOMEN in the second model (0.0498) is lower than in the first model (0.0532), which suggests the second model is slightly better in terms of the variability for this coefficient.
+Interpretation: The second model is slightly more robust for the ABDOMEN coefficient due to lower standard error.
+
+WRIST (Only in the second model):
+The WRIST coefficient has a relatively high bias (−0.0093 and a large standard error (0.4255), which indicates that this predictor may not be as stable or reliable as the others.
+Interpretation: Adding WRIST to the model introduces more uncertainty, which decreases the robustness of the model overall.
+
+Overall Interpretation:
+First Model (WEIGHT + ABDOMEN):
+The model shows lower standard errors overall, especially for the intercept and the WEIGHT predictor, making it more robust in terms of coefficient stability. It has lower variability in its coefficients across resamples.
+Second Model (WEIGHT + ABDOMEN + WRIST):
+While the second model performs reasonably well for the ABDOMEN and WEIGHT predictors, the inclusion of the WRIST predictor increases the standard error and bias, particularly for the WRIST coefficient. This reduces the overall robustness of the model. Additionally, the intercept’s variability is much larger in the second model, making it less stable.
+
+Conclusion:
+The first model (WEIGHT + ABDOMEN) appears to be more robust due to lower standard errors and less variability in the coefficients. The addition of the WRIST variable in the second model increases the bias and variability, reducing the robustness of the model. Therefore, based on bootstrap results, the first model is preferred in terms of robustness.
+
+```{r}
+boot_fn3 <- function(data, indices) {
+  data_boot <- data[indices, ]
+  model_boot3 <- lm(BODYFAT ~ WEIGHT + ABDOMEN+WRIST+FOREARM, data = data_boot)
+  return(coef(model_boot3))
+}
+results3 <- boot(data, boot_fn3, R = 1000)
+print(results3)
+bootstrap_means <- apply(results3$t, 2, mean)   
+bias <- bootstrap_means - results3$t0           
+std_error <- apply(results3$t, 2, sd)           
+
+robustness_index3 <- sqrt(sum((bias /results3$t0)^2 + (std_error / results3$t0)^2))
+robustness_index3
+```
+
+```{r}
+
+boot_fn4 <- function(data, indices) {
+  data_boot <- data[indices, ]
+  model_boot4 <- lm(BODYFAT ~ WEIGHT + ABDOMEN+WRIST+FOREARM+NECK, data = data_boot)
+  return(coef(model_boot4))
+}
+results4 <- boot(data, boot_fn4, R = 1000)
+print(results4)
+bootstrap_means <- apply(results4$t, 2, mean)   
+bias <- bootstrap_means - results4$t0           
+std_error <- apply(results4$t, 2, sd)           
+
+robustness_index4 <- sqrt(sum((bias /results4$t0)^2 + (std_error / results4$t0)^2))
+robustness_index4
+```
+```{r}
+boot_fn5 <- function(data, indices) {
+  data_boot <- data[indices, ]
+  model_boot5 <- lm(BODYFAT  ~  WEIGHT + ABDOMEN+WRIST+FOREARM+NECK+CHEST, data = data_boot)
+  return(coef(model_boot5))
+}
+results5 <- boot(data, boot_fn5, R = 1000)
+print(results5)
+bootstrap_means <- apply(results5$t, 2, mean) 
+bias <- bootstrap_means - results5$t0           
+std_error <- apply(results5$t, 2, sd)           
+
+robustness_index5 <- sqrt(sum((bias /results5$t0)^2 + (std_error / results5$t0)^2))
+robustness_index5
+
+```
+
+```{r}
+bubble <-  data.frame(Model=c(1,2,3,4,5,6),
+  Accuracy = c(0.66, 0.72,0.73,0.74,0.74,0.74),   
+  Simplicity = c(1,2,3,4,5,6),
+  Robustness = c(0.04, 0.05,0.42,0.43,0.46,0.84)  
+)
+bubble$Normalized_Simplicity <- rescale(1 / bubble$Simplicity, to = c(0, 1))  
+bubble$Normalized_Robustness <- rescale(1 / bubble$Robustness, to = c(0, 1)) 
+
+plot<-ggplot(bubble, aes(x = Normalized_Simplicity, y = Normalized_Robustness, size = Accuracy)) +
+  geom_point(alpha = 0.7) +  
+  scale_size_continuous(range = c(10,20)) + 
+  labs( title = "Bubble Plot for Model Comparison (Using Rankings)",
+       x = "Simplicity (Higher is Simpler)",
+       y = "Robustness (Higher is More Robust)",
+       size = "Accuracy") +  
+  
+   theme_minimal(base_size = 15) +  
+  geom_text(aes(label = Model), vjust = -0.5, size = 5) +  
+  geom_point(data = subset(bubble, Model == 2), aes(x = Normalized_Simplicity, y = Normalized_Robustness), color = "red", size = 18, shape = 21, fill = "red") + 
+  geom_text(data = subset(bubble, Model == 2), aes(label = "Model 2"), vjust = -1.5, size = 6, color = "red") +  # 标注“Model 2”文字
+  theme(legend.position = "right")
+#ggsave("bubble_plot.png", plot = plot, width = 10, height = 8, dpi = 300)
+```
+
+
+```{r}
+predictions <- predict(model2, newdata = data)
+
+relative_error <- abs((data$BODYFAT - predictions) / data$BODYFAT) * 100
+
+relative_error[is.infinite(relative_error)] <- NA
+
+summary(relative_error)
+
+within_3_percent <- mean(relative_error <= 3, na.rm = TRUE) * 100
+within_5_percent <- mean(relative_error <= 5, na.rm = TRUE) * 100
+within_10_percent <- mean(relative_error <= 10, na.rm = TRUE) * 100
+
+# Print results
+cat("Percentage of predictions within +/- 3% of true value:", within_3_percent, "%\n")
+cat("Percentage of predictions within +/- 5% of true value:", within_5_percent, "%\n")
+cat("Percentage of predictions within +/- 10% of true value:", within_10_percent, "%\n")
+
+```
+
+```{r}
+correlation_pearson <- cor(data$WEIGHT, data$ABDOMEN, method = "pearson")
+
+print(correlation_pearson)
+
+cor_test_pearson <- cor.test(data$WEIGHT, data$ABDOMEN, method = "pearson")
+print(cor_test_pearson)
+
+correlation_pearson <- cor(data$WRIST, data$ABDOMEN, method = "pearson")
+
+print(correlation_pearson)
+
+cor_test_pearson <- cor.test(data$WRIST, data$ABDOMEN, method = "pearson")
+print(cor_test_pearson)
+```
+
+```{r}
+plot(model2$fitted.values, residuals(model2), 
+     main = "Residual Plot", 
+     xlab = "Fitted Values", 
+     ylab = "Residuals")
+abline(h = 0, col = "red")
+```
+
+**Linearity and Homoskedasticity: Residual Plot**
+
+```{r}
+qqnorm(residuals(model2))
+qqline(residuals(model2), col = "red")
+shapiro.test(residuals(model2))
+```
+
+**Multicollinearity**
+
+```{r}
+library(car)
+vif(model2)
+```
+```{r}
+hatvalues <- hatvalues(model2)
+plot(hatvalues, main = "Leverage Plot", 
+     ylab = "Leverage", 
+     xlab = "Observation Number")
+abline(h = 2 * mean(hatvalues), col = "red") 
+```
+
+**Influential/Leverage Points: Cook’s Distance and Leverage**
+
+```{r}
+cooksd <- cooks.distance(model2)
+
+plot(cooksd, main = "Cook's Distance", 
+     ylab = "Cook's Distance", 
+     xlab = "Observation Number")
+abline(h = 4/(nrow(data)-length(coef(model2))), col = "red")  
+
+cooksd <- cooks.distance(model2)
+
+threshold <- 4 / (nrow(data) - length(coef(model2)))
+
+influential_points <- which(cooksd > 0.1)
+
+print(influential_points)
+
+print(cooksd[influential_points])
+```
